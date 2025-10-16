@@ -4,9 +4,9 @@ import threading
 import random
 
 nodes = []
-buffer = {} # items are in the form 'node_id': [(msg_type, value)]
+buffer = {}
+election_finished = False
 
-# Message types
 CANDIDACY = 'candidacy'
 VOTE = 'vote'
 HEARTBEAT = 'heartbeat'
@@ -16,12 +16,12 @@ class Node:
         buffer[id] = []
         self.id = id
         self.working = True
-        self.state = 'follower'  # Start as follower
+        self.state = 'follower'
         self.votes_received = 0
         self.voted_for = None
         self.last_heartbeat = time.time()
-        self.election_timeout = 1.0  # 1 second timeout for heartbeat detection
-        self.heartbeat_interval = 0.5  # Send heartbeat every 0.5 seconds
+        self.election_timeout = 1.0
+        self.heartbeat_interval = 0.5
         self.election_start_time = 0
         self.is_candidate = False
 
@@ -31,25 +31,21 @@ class Node:
 
     def run(self):
         while True:
-            # Process incoming messages
             while buffer[self.id]:
                 msg_type, value = buffer[self.id].pop(0)
                 if self.working: self.deliver(msg_type,value)
             
-            # Check for heartbeat timeout and start election if needed
-            if self.working and self.state == 'follower':
+            if self.working and self.state == 'follower' and not self.is_candidate and self.voted_for is None:
                 if time.time() - self.last_heartbeat > self.election_timeout:
                     self.start_election()
             
-            # Leader sends heartbeats
             if self.working and self.state == 'leader':
                 if time.time() - self.last_heartbeat >= self.heartbeat_interval:
                     self.broadcast(HEARTBEAT, self.id)
                     self.last_heartbeat = time.time()
             
-            # Check election timeout for candidates
             if self.working and self.state == 'candidate':
-                if time.time() - self.election_start_time > 2.0:  # 2 second vote collection period
+                if time.time() - self.election_start_time > 2.0:
                     self.count_votes()
             
             time.sleep(0.1)
@@ -70,54 +66,52 @@ class Node:
             self.working = True
 
     def start_election(self):
-        """Start election process with random delay"""
-        if self.state != 'follower':
+        if self.state != 'follower' or self.is_candidate or self.voted_for is not None:
             return
         
-        # Random delay between 1-3 seconds
         delay = random.uniform(1.0, 3.0)
         print(f'node {self.id} is starting an election.')
         
-        # Start a separate thread for the delayed election
+        self.is_candidate = True
+        
         threading.Thread(target=self._delayed_election, args=(delay,)).start()
     
     def _delayed_election(self, delay):
-        """Execute election after delay, checking for other candidacies"""
         time.sleep(delay)
         
-        # Check if we received any candidacy messages during the delay
-        if self.state == 'follower' and not self.is_candidate:
+        if self.state == 'follower' and self.is_candidate and self.voted_for is None:
             self.become_candidate()
     
     def become_candidate(self):
-        """Become a candidate and start vote collection"""
         if self.state != 'follower':
             return
             
         self.state = 'candidate'
-        self.votes_received = 1  # Vote for self
+        self.votes_received = 1
         self.voted_for = self.id
         self.election_start_time = time.time()
         self.is_candidate = True
         
-        # Broadcast candidacy
         self.broadcast(CANDIDACY, self.id)
         print(f'node {self.id} voted to node {self.id}')
     
     def count_votes(self):
-        """Count votes and determine if elected"""
+        global election_finished
+        
         if self.state != 'candidate':
             return
             
         total_nodes = len([n for n in nodes if n.working])
         majority = total_nodes // 2 + 1
         
+        print(f'node {self.id} election results: {self.votes_received}/{total_nodes} votes (need {majority} for majority)')
+        
         if self.votes_received >= majority:
             self.state = 'leader'
             print(f'node {self.id} detected node {self.id} as leader')
             self.last_heartbeat = time.time()
+            election_finished = True
         else:
-            # Election failed, return to follower
             self.state = 'follower'
             self.votes_received = 0
             self.voted_for = None
@@ -125,7 +119,6 @@ class Node:
         self.is_candidate = False
 
     def deliver(self, msg_type, value):
-        """Handle incoming messages"""
         if not self.working:
             return
             
@@ -137,32 +130,33 @@ class Node:
             self.handle_vote(value)
     
     def handle_heartbeat(self, leader_id):
-        """Handle heartbeat message from leader"""
         self.last_heartbeat = time.time()
         
-        # If we're a candidate or follower, accept this leader
-        if self.state in ['candidate', 'follower']:
+        if self.state == 'candidate':
             self.state = 'follower'
             self.votes_received = 0
             self.voted_for = None
             self.is_candidate = False
             print(f'node {self.id} got a heartbeat and followed node {leader_id} as leader')
+        elif self.state == 'follower':
+            self.is_candidate = False
+            self.voted_for = None
+            self.votes_received = 0
     
     def handle_candidacy(self, candidate_id):
-        """Handle candidacy message from another node"""
-        # If we haven't voted yet, vote for this candidate
         if self.voted_for is None and self.state == 'follower':
             self.voted_for = candidate_id
             self.broadcast(VOTE, {'voter': self.id, 'candidate': candidate_id})
             print(f'node {self.id} voted to node {candidate_id}')
         
-        # If we're waiting to become a candidate, cancel our candidacy
         if self.state == 'follower' and self.is_candidate:
             self.is_candidate = False
     
     def handle_vote(self, vote_data):
-        """Handle vote message"""
-        if self.state == 'candidate' and vote_data['candidate'] == self.id:
+        voter_id = vote_data['voter']
+        candidate_id = vote_data['candidate']
+        
+        if self.state == 'candidate' and candidate_id == self.id:
             self.votes_received += 1
 
 def initialize(N):
@@ -172,19 +166,16 @@ def initialize(N):
         node.start()
 
 if __name__ == "__main__":
-    os.system('clear')
     N = 3
     initialize(N)
     print('actions: state, crash, recover')
-    while True:
-        act = input('\t$ ')
-        if act == 'crash' : 
-            id = int(input('\tid > '))
-            if 0<= id and id<N: nodes[id].crash()
-        elif act == 'recover' : 
-            id = int(input('\tid > '))
-            if 0<= id and id<N: nodes[id].recover()
-        elif act == 'state':
-            for node in nodes:
-                print(f'\t\tnode {node.id}: {node.state}')
+    
+    while not election_finished:
+        time.sleep(0.1)
+    
+    print('\nFinal state:')
+    for node in nodes:
+        print(f'node {node.id}: {node.state}')
+    
+    print('\nElection completed. Program exiting.')
 

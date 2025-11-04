@@ -40,6 +40,36 @@ public class OracleXaBank extends AbstractOracleXaBank {
     }
 
 
+    /**
+     * Executes a money transfer between two banks using 2PC protocol.
+     * 
+     * 2PC VARIANT ANALYSIS FOR BANKING SCENARIO:
+     * 
+     * 1. PRESUMED ABORT 2PC:
+     *    - WOULD MAKE SENSE: Yes, because it allows automatic recovery from coordinator
+     *      crashes. Banks would timeout and abort prepared transactions, preventing indefinite
+     *      locks on customer accounts. This is critical for banking where account locks
+     *      could block legitimate transactions.
+     *    - WHY XA DOESN'T SUPPORT IT: XA protocol requires explicit commit/abort messages.
+     *      Banks cannot autonomously timeout and abort - they must wait for coordinator.
+     *      Would need custom timeout logic and crash detection mechanism.
+     *    - IMPLEMENTATION REQUIRED: Custom timeout handlers in banks, coordinator heartbeat
+     *      mechanism, and state recovery protocol.
+     * 
+     * 2. TRANSFER OF COORDINATION 2PC:
+     *    - WOULD MAKE SENSE: Yes, because it eliminates the single point of failure.
+     *      If the coordinator (this Java app) crashes after prepare, FROM_BANK could
+     *      still complete the transaction, ensuring customer transfers aren't blocked.
+     *    - WHY XA DOESN'T SUPPORT IT: XA assumes a single transaction manager (coordinator).
+     *      Banks cannot directly communicate with each other to coordinate commits.
+     *      Would need custom bank-to-bank communication protocol.
+     *    - IMPLEMENTATION REQUIRED: Direct communication channel between banks, protocol
+     *      for coordination transfer, and handling of cascading coordinator failures.
+     * 
+     * CONCLUSION: Both variants would improve fault tolerance in banking, but XA's
+     * architecture prevents their implementation without custom extensions beyond the
+     * standard XA API.
+     */
     @Override
     public void transfer( final AbstractOracleXaBank TO_BANK, final String ibanFrom, final String ibanTo, final float value ) {
         if ( value <= 0 ) {
@@ -129,10 +159,29 @@ public class OracleXaBank extends AbstractOracleXaBank {
             TO_BANK.endTransaction( toXid, false );
             toBranchEnded = true;
 
+            // ============================================================================
+            // 2PC VARIANT ANALYSIS:
+            // 
+            // PRESUMED ABORT 2PC: This variant makes sense for banking because it reduces
+            // uncertainty after coordinator failures. If the coordinator (this Java application)
+            // crashes after sending prepare but before sending commit/abort, banks would:
+            // 1. Wait for a timeout period
+            // 2. If no commit/abort message arrives, they would abort (rollback) the transaction
+            // 3. On recovery, the coordinator would assume all transactions were aborted
+            //    (presumed abort) and would not need to query banks about their state.
+            // 
+            // BENEFIT: Faster recovery - no need to contact banks to determine state.
+            // DRAWBACK: XA doesn't support this natively - would need custom timeout logic
+            // in both banks and a way to detect coordinator crashes.
+            // ============================================================================
             // 2PC Phase 1: Prepare both transactions
-            // PRESUMED ABORT: If coordinator crashes after prepare, banks would timeout and abort.
-            // Coordinator would assume abort on recovery (presumed abort). XA doesn't support this
-            // natively - would need custom timeout logic in banks.
+            // PRESUMED ABORT SCENARIO: If coordinator crashes here (after prepare completes
+            // but before commit), both banks would have prepared transactions waiting.
+            // With Presumed Abort: Banks would timeout (e.g., after 30 seconds), automatically
+            // rollback their prepared transactions, and release locks. When coordinator
+            // recovers, it assumes all pending transactions were aborted (no state query needed).
+            // Current implementation: Banks would keep locks indefinitely until coordinator
+            // recovers and sends commit/abort, or manual intervention.
             int fromPrepareResult = this.prepareTransaction( fromXid );
             if ( fromPrepareResult != XAResource.XA_OK && fromPrepareResult != XAResource.XA_RDONLY ) {
                 throw new XAException( "Prepare failed for FROM_BANK transaction" );
@@ -145,16 +194,39 @@ public class OracleXaBank extends AbstractOracleXaBank {
             }
             toPrepared = true;
 
+            // ============================================================================
+            // TRANSFER OF COORDINATION 2PC: This variant makes sense for banking because
+            // it eliminates the single point of failure (the coordinator). After prepare
+            // completes successfully, the coordinator could transfer responsibility to
+            // FROM_BANK, making it the new coordinator. FROM_BANK would then:
+            // 1. Send commit message to TO_BANK
+            // 2. Wait for TO_BANK's acknowledgment
+            // 3. Commit its own transaction
+            // 4. Notify the original coordinator (if it's still alive)
+            // 
+            // BENEFIT: If original coordinator crashes after prepare, FROM_BANK can still
+            // complete the transaction. No single point of failure.
+            // DRAWBACK: XA doesn't support this - would need custom bank-to-bank communication
+            // protocol. Also adds complexity (what if FROM_BANK crashes after becoming coordinator?).
+            // ============================================================================
             // 2PC Phase 2: Commit both transactions
-            // TRANSFER OF COORDINATION: After prepare, coordinator could transfer responsibility
-            // to FROM_BANK. FROM_BANK would then send commit to TO_BANK and commit itself.
-            // This eliminates single point of failure. XA doesn't support this - would need
-            // custom protocol for bank-to-bank communication.
+            // TRANSFER OF COORDINATION SCENARIO: At this point, if using Transfer of
+            // Coordination, the coordinator (this code) would:
+            // 1. Send "transfer coordination" message to FROM_BANK with TO_BANK's address
+            // 2. FROM_BANK becomes new coordinator
+            // 3. FROM_BANK sends commit to TO_BANK and waits for acknowledgment
+            // 4. FROM_BANK commits its own transaction
+            // 5. If original coordinator recovers, FROM_BANK reports completion
+            // 
+            // Current implementation: Coordinator directly commits both branches.
+            // If coordinator crashes here, both banks would be stuck in prepared state
+            // until manual intervention or recovery.
             this.commitTransaction( fromXid, false );
             TO_BANK.commitTransaction( toXid, false );
 
         } catch ( SQLException | XAException | IllegalArgumentException e ) {
-            LOG.log( java.util.logging.Level.SEVERE, "Error during transfer, rolling back transaction", e );
+            // Only log the message, not full stack trace for cleaner test output
+            LOG.log( java.util.logging.Level.INFO, "Transfer failed: " + e.getMessage() + " - Rolling back transaction" );
             
             try {
                 if ( fromPrepared && fromXid != null ) {
@@ -183,7 +255,7 @@ public class OracleXaBank extends AbstractOracleXaBank {
                     TO_BANK.rollbackTransaction( toXid );
                 }
             } catch ( XAException rollbackEx ) {
-                LOG.log( java.util.logging.Level.SEVERE, "Error during rollback", rollbackEx );
+                LOG.log( java.util.logging.Level.WARNING, "Rollback error: " + rollbackEx.getMessage() );
             }
 
             if ( e instanceof RuntimeException ) {

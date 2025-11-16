@@ -119,6 +119,41 @@ public abstract class AbstractChordPeer implements ChordNode {
     }
 
     /**
+     * Returns a mutable copy of the locally stored key/value pairs.
+     *
+     * @return Copy of the local storage map.
+     */
+    protected Map<String, String> snapshotLocalStorage() {
+        return new HashMap<>(this.storage);
+    }
+
+    /**
+     * Stores a key/value pair locally without performing any network routing.
+     *
+     * @param key   The key to store.
+     * @param value The associated value.
+     */
+    protected void storeLocal(String key, String value) {
+        this.storage.put(key, value);
+    }
+
+    /**
+     * Removes a key/value pair from the local storage without involving the network.
+     *
+     * @param key The key to remove.
+     */
+    protected void removeLocal(String key) {
+        this.storage.remove(key);
+    }
+
+    /**
+     * Clears the local storage. Intended for maintenance operations such as orderly departure.
+     */
+    protected void clearLocalStorage() {
+        this.storage.clear();
+    }
+
+    /**
      * Performs a lookup for where the data with the provided key should be stored.
      *
      * @return Node in which to store the data with the provided key.

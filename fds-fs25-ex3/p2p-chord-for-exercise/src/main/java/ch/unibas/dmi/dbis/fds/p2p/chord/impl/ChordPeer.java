@@ -364,6 +364,65 @@ public class ChordPeer extends AbstractChordPeer {
     }
     
     /**
+     * Performs an orderly departure from the Chord network. All locally stored data is transferred to the successor,
+     * neighbours are rewired to bypass this node, and the node is marked offline.
+     */
+    public synchronized void orderlyLeave() {
+        if (this.status() != NodeStatus.ONLINE) {
+            throw new IllegalStateException("Node must be online before it can depart.");
+        }
+
+        ChordNode successor = this.successor();
+        ChordNode predecessor = this.predecessor();
+
+        // Nothing to do if this node is alone in the ring.
+        if (successor == null || successor == this) {
+            this.clearLocalStorage();
+            super.leave();
+            this.setPredecessor(null);
+            this.fingerTable.setNode(1, this);
+            return;
+        }
+
+        // Rewire neighbours to bypass this node.
+        if (predecessor != null && predecessor != this) {
+            if (predecessor instanceof ChordPeer) {
+                ((ChordPeer) predecessor).fingerTable.setNode(1, successor);
+            }
+            successor.setPredecessor(predecessor);
+        } else {
+            successor.setPredecessor(successor);
+        }
+
+        // Transfer local data ownership to the successor.
+        Map<String, String> localData = this.snapshotLocalStorage();
+        if (!localData.isEmpty()) {
+            if (successor instanceof AbstractChordPeer) {
+                AbstractChordPeer successorPeer = (AbstractChordPeer) successor;
+                for (Map.Entry<String, String> entry : localData.entrySet()) {
+                    successorPeer.storeLocal(entry.getKey(), entry.getValue());
+                    this.removeLocal(entry.getKey());
+                }
+            } else {
+                for (Map.Entry<String, String> entry : localData.entrySet()) {
+                    successor.store(this, entry.getKey(), entry.getValue());
+                    this.removeLocal(entry.getKey());
+                }
+            }
+        }
+
+        // Trigger stabilisation on neighbours so finger tables converge quickly.
+        successor.stabilize();
+        if (predecessor != null && predecessor != this) {
+            predecessor.stabilize();
+        }
+
+        super.leave();
+        this.setPredecessor(null);
+        this.fingerTable.setNode(1, this);
+    }
+    
+    /**
     * Performs a lookup for where the data with the provided key should be stored.
     *
     * @return Node in which to store the data with the provided key.
